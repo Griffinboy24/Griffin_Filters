@@ -17,7 +17,7 @@ namespace project {
     using namespace scriptnode;
 
     namespace FunctionsClasses {
-        // Tanh helper class with a compile-time option for a polynomial approximation.
+        // Tanh helper class with compiletime option for a polynomial approximation.
         template <bool UseApprox>
         struct TanhHelper {
             static inline float tanh(float x) { return std::tanh(x); }
@@ -28,7 +28,7 @@ namespace project {
         struct TanhHelper<true> {
             static inline float tanh(float x) {
                 float x2 = x * x;
-                // Approximation: tanh(x) approx = sh/sqrt(1+sh^2), with sh = x*(1 + x^2/6 + x^4/120)
+                // Approximation
                 float sh = x * (1.f + x2 * (1.f / 6.f + x2 * (1.f / 120.f)));
                 return sh / std::sqrt(1.f + sh * sh);
             }
@@ -36,28 +36,24 @@ namespace project {
     }
 
     // Monophonic ladder filter voice class.
-    // Keytracking: effectiveCutoff = cutoff * exp2((note-60)*keytrackAmount/12)
-    // No Eigen dependency; uses a manual Newton-Raphson update.
     template <bool UseApproxTanh = USE_APPROX_TANH>
     class AudioEffect {
     public:
         AudioEffect(float initCutoff = 5000.f, float initResonance = 1.f)
-            : cutoff(initCutoff), resonance(initResonance), keytrackAmount(0.0f), note(60)
+            : cutoff(initCutoff), resonance(initResonance), keytrackAmount(0.f), note(60),
+            fbk(1.f), b(0.65f), errorThresh(0.000001f)
         {
-            fbk = 1.f;  // feedback factor (constant)
-            b = 0.65f;  // bias value
-            errorThresh = 0.000001f;
             for (int i = 0; i < 5; i++)
                 y[i] = 0.f;
             s1 = s2 = s3 = s4 = s5 = 0.f;
         }
 
-        // Initialize with current sample rate.
+        // Initialize with the current sample rate.
         void prepare(double sampleRate) {
             sr = sampleRate;
         }
 
-        // Reset internal state (used by polyphonic reset).
+        // Reset internal state.
         void reset() {
             for (int i = 0; i < 5; i++)
                 y[i] = 0.f;
@@ -66,86 +62,105 @@ namespace project {
 
         // Process a single sample.
         inline float processSample(float x) {
-            // Compute effective cutoff with keytracking.
-            float effectiveCutoff = cutoff * std::exp2(((float)note - 60.f) * keytrackAmount / 12.f);
-            if (effectiveCutoff < 20.f)
-                effectiveCutoff = 20.f;
-            if (effectiveCutoff > sr * 0.49f)
-                effectiveCutoff = sr * 0.49f;
-
-            // Compute g from effective cutoff.
+            float effectiveCutoff = cutoff * std::exp2((float(note) - 60.f) * keytrackAmount / 12.f);
+            effectiveCutoff = std::max(20.f, std::min(effectiveCutoff, float(sr * 0.49f)));
             float g = std::tan(effectiveCutoff * M_PI / sr);
             const int maxIter = 50;
             int iter = 0;
             float residue = 1e6f;
-            float y_prev[5];
-            float F[5];
-            float j00, j03, j04, j10, j11, j21, j22, j32, j33, j43;
-            float den = 0.f;
-            // Pre-calculate highpass variables for F[4]
             float Fc_hp = 8.f;
             float g_hp = Fc_hp * M_PI / sr;
             float g_den = 2.f * g_hp + 1.f;
 
-            // Newton-Raphson iteration.
             while (std::abs(residue) > errorThresh && iter < maxIter) {
-                // Save previous state.
-                for (int k = 0; k < 5; k++)
-                    y_prev[k] = y[k];
+                // Save only previous y[3] for convergence test.
+                float old_y3 = y[3];
 
                 float tanh_x = FunctionsClasses::TanhHelper<UseApproxTanh>::tanh(x - resonance * y[3] + y[4]);
-                float tanh_y1 = FunctionsClasses::TanhHelper<UseApproxTanh>::tanh(y[0]);
-                float tanh_y2 = FunctionsClasses::TanhHelper<UseApproxTanh>::tanh(y[1]);
-                float tanh_y3 = FunctionsClasses::TanhHelper<UseApproxTanh>::tanh(y[2]);
-                float tanh_y4 = FunctionsClasses::TanhHelper<UseApproxTanh>::tanh(y[3]);
+                float tanh_y0 = FunctionsClasses::TanhHelper<UseApproxTanh>::tanh(y[0]);
+                float tanh_y1 = FunctionsClasses::TanhHelper<UseApproxTanh>::tanh(y[1]);
+                float tanh_y2 = FunctionsClasses::TanhHelper<UseApproxTanh>::tanh(y[2]);
+                float tanh_y3 = FunctionsClasses::TanhHelper<UseApproxTanh>::tanh(y[3]);
                 float tanh_y5 = FunctionsClasses::TanhHelper<UseApproxTanh>::tanh(fbk * (y[3] - b));
 
-                F[0] = g * (tanh_x - tanh_y1) + s1 - y[0];
-                F[1] = g * (tanh_y1 - tanh_y2) + s2 - y[1];
-                F[2] = g * (tanh_y2 - tanh_y3) + s3 - y[2];
-                F[3] = g * (tanh_y3 - tanh_y4) + s4 - y[3];
-                F[4] = (tanh_y5 + s5) / g_den - y[4];
+                float F0 = g * (tanh_x - tanh_y0) + s1 - y[0];
+                float F1 = g * (tanh_y0 - tanh_y1) + s2 - y[1];
+                float F2 = g * (tanh_y1 - tanh_y2) + s3 - y[2];
+                float F3 = g * (tanh_y2 - tanh_y3) + s4 - y[3];
+                float F4 = (tanh_y5 + s5) / g_den - y[4];
 
-                float help_x = 1.f - (tanh_x * tanh_x);
-                float help_y1 = 1.f - (tanh_y1 * tanh_y1);
-                float help_y2 = 1.f - (tanh_y2 * tanh_y2);
-                float help_y3 = 1.f - (tanh_y3 * tanh_y3);
-                float help_y4 = 1.f - (tanh_y4 * tanh_y4);
-                float help_y5 = 1.f - (tanh_y5 * tanh_y5);
+                float help_x = 1.f - tanh_x * tanh_x;
+                float help_y0 = 1.f - tanh_y0 * tanh_y0;
+                float help_y1 = 1.f - tanh_y1 * tanh_y1;
+                float help_y2 = 1.f - tanh_y2 * tanh_y2;
+                float help_y3 = 1.f - tanh_y3 * tanh_y3;
+                float help_y5 = 1.f - tanh_y5 * tanh_y5;
                 float minus_g = -g;
 
-                // Jacobian nonzero elements.
-                j00 = minus_g * help_y1 - 1.f;
-                j03 = minus_g * resonance * help_x;
-                j04 = g * help_x;
-                j10 = g * help_y1;
-                j11 = minus_g * help_y2 - 1.f;
-                j21 = g * help_y2;
-                j22 = minus_g * help_y3 - 1.f;
-                j32 = g * help_y3;
-                j33 = minus_g * help_y4 - 1.f;
-                j43 = fbk * help_y5 / g_den;
+                // Jacobian elements.
+                float j00 = minus_g * help_y0 - 1.f;
+                float j03 = minus_g * resonance * help_x;
+                float j04 = g * help_x;
+                float j10 = g * help_y0;
+                float j11 = minus_g * help_y1 - 1.f;
+                float j21 = g * help_y1;
+                float j22 = minus_g * help_y2 - 1.f;
+                float j32 = g * help_y2;
+                float j33 = minus_g * help_y3 - 1.f;
+                float j43 = fbk * help_y5 / g_den;
 
-                den = j00 * j11 * j22 * j33 - j03 * j10 * j21 * j32 - j04 * j10 * j21 * j32 * j43;
+                float temp = j10 * j21 * j32;
+                float den = j00 * j11 * j22 * j33 - j03 * temp - j04 * temp * j43;
 
-                // Manual Newton-Raphson update.
-                y[0] = y[0] - (F[0] * j11 * j22 * j33 - F[1] * (j03 * j21 * j32 + j04 * j21 * j32 * j43) +
-                    F[2] * (j03 * j11 * j32 + j04 * j11 * j32 * j43) - F[3] * (j03 * j11 * j22 + j04 * j11 * j22 * j43) +
-                    F[4] * j04 * j11 * j22 * j33) / den;
-                y[1] = y[1] + (F[0] * j10 * j22 * j33 - F[1] * j00 * j22 * j33 +
-                    F[2] * (j03 * j10 * j32 + j04 * j10 * j32 * j43) - F[3] * (j03 * j10 * j22 + j04 * j10 * j22 * j43) +
-                    F[4] * j04 * j10 * j22 * j33) / den;
-                y[2] = y[2] - (F[0] * j10 * j21 * j33 - F[1] * j00 * j21 * j33 +
-                    F[2] * j00 * j11 * j33 - F[3] * (j03 * j10 * j21 + j04 * j10 * j21 * j43) +
-                    F[4] * j04 * j10 * j21 * j33) / den;
-                y[3] = y[3] + (F[0] * j10 * j21 * j32 - F[1] * j00 * j21 * j32 +
-                    F[2] * j00 * j11 * j32 - F[3] * j00 * j11 * j22 +
-                    F[4] * j04 * j10 * j21 * j32) / den;
-                y[4] = y[4] + (F[0] * j10 * j21 * j32 * j43 - F[1] * j00 * j21 * j32 * j43 +
-                    F[2] * j00 * j11 * j32 * j43 - F[3] * j00 * j11 * j22 * j43 +
-                    F[4] * (j00 * j11 * j22 * j33 - j03 * j10 * j21 * j32)) / den;
+                float T1 = j11 * j22 * j33;
+                float T2 = j03 * j21 * j32;
+                float T3 = j04 * j21 * j32 * j43;
+                float T4 = j03 * j11 * j32;
+                float T5 = j04 * j11 * j32 * j43;
+                float T6 = j03 * j11 * j22;
+                float T7 = j04 * j11 * j22 * j43;
+                float T8 = j04 * j11 * j22 * j33;
+                float delta0 = (F0 * T1 - F1 * (T2 + T3) + F2 * (T4 + T5) - F3 * (T6 + T7) + F4 * T8) / den;
 
-                residue = y[3] - y_prev[3];
+                float T9 = j10 * j22 * j33;
+                float T10 = j00 * j22 * j33;
+                float T11 = j03 * j10 * j32;
+                float T12 = j04 * j10 * j32 * j43;
+                float T13 = j03 * j10 * j22;
+                float T14 = j04 * j10 * j22 * j43;
+                float T15 = j04 * j10 * j22 * j33;
+                float delta1 = (F0 * T9 - F1 * T10 + F2 * (T11 + T12) - F3 * (T13 + T14) + F4 * T15) / den;
+
+                float T16 = j10 * j21 * j33;
+                float T17 = j00 * j21 * j33;
+                float T18 = j00 * j11 * j33;
+                float T19 = j03 * j10 * j21;
+                float T20 = j04 * j10 * j21 * j43;
+                float T21 = j04 * j10 * j21 * j33;
+                float delta2 = (F0 * T16 - F1 * T17 + F2 * T18 - F3 * (T19 + T20) + F4 * T21) / den;
+
+                float T22 = j10 * j21 * j32;
+                float T23 = j00 * j21 * j32;
+                float T24 = j00 * j11 * j32;
+                float T25 = j00 * j11 * j22;
+                float T26 = j04 * j10 * j21 * j32;
+                float delta3 = (F0 * T22 - F1 * T23 + F2 * T24 - F3 * T25 + F4 * T26) / den;
+
+                float T27 = j10 * j21 * j32 * j43;
+                float T28 = j00 * j21 * j32 * j43;
+                float T29 = j00 * j11 * j32 * j43;
+                float T30 = j00 * j11 * j22 * j43;
+                float T31 = j00 * j11 * j22 * j33;
+                float T32 = j03 * j10 * j21 * j32;
+                float delta4 = (F0 * T27 - F1 * T28 + F2 * T29 - F3 * T30 + F4 * (T31 - T32)) / den;
+
+                y[0] -= delta0;
+                y[1] += delta1;
+                y[2] -= delta2;
+                y[3] += delta3;
+                y[4] += delta4;
+
+                residue = y[3] - old_y3;
                 iter++;
             }
 
@@ -180,7 +195,6 @@ namespace project {
     };
 
     // Polyphonic node implementing polyphony, per-sample smoothing, and keytracking.
-    // Uses a PolyData container for left/right channels.
     template <int NV>
     struct Griffin_Moog242 : public data::base {
         SNEX_NODE(Griffin_Moog242);
@@ -201,16 +215,14 @@ namespace project {
         static constexpr int NumFilters = 0;
         static constexpr int NumDisplayBuffers = 0;
 
-        // Outer-level parameters and their smoothed versions.
-        float cutoffFrequency = 5000.0f;
-        float resonance = 1.0f;
-        float keytrackAmount = 0.0f;
+        float cutoffFrequency = 5000.f;
+        float resonance = 1.f;
+        float keytrackAmount = 0.f;
 
         SmoothedValue<float> cutoffSmooth;
         SmoothedValue<float> resonanceSmooth;
         SmoothedValue<float> keytrackSmooth;
 
-        // Polyphonic voices for left and right channels.
         PolyData<AudioEffect<>, NV> filtersLeft;
         PolyData<AudioEffect<>, NV> filtersRight;
 
@@ -219,7 +231,6 @@ namespace project {
             cutoffSmooth.reset(sampleRate, 0.01);
             resonanceSmooth.reset(sampleRate, 0.01);
             keytrackSmooth.reset(sampleRate, 0.01);
-
             cutoffSmooth.setCurrentAndTargetValue(cutoffFrequency);
             resonanceSmooth.setCurrentAndTargetValue(resonance);
             keytrackSmooth.setCurrentAndTargetValue(keytrackAmount);
@@ -232,7 +243,6 @@ namespace project {
                 voice.prepare(sampleRate);
         }
 
-        // Iterate over each voice to reset its state.
         void reset() {
             for (auto& voice : filtersLeft)
                 voice.reset();
@@ -249,12 +259,14 @@ namespace project {
             int numSamples = static_cast<int>(data.getNumSamples());
 
             for (int i = 0; i < numSamples; ++i) {
-                // Get per-sample smoothed parameters.
                 float cVal = cutoffSmooth.getNextValue();
                 float rVal = resonanceSmooth.getNextValue();
                 float ktVal = keytrackSmooth.getNextValue();
+                float inL = leftChannelData[i];
+                float inR = rightChannelData[i];
+                float outL = 0.f;
+                float outR = 0.f;
 
-                // Update all voices.
                 for (auto& voice : filtersLeft) {
                     voice.setCutoff(cVal);
                     voice.setResonance(rVal);
@@ -265,19 +277,11 @@ namespace project {
                     voice.setResonance(rVal);
                     voice.setKeytrack(ktVal);
                 }
-
-                float inL = leftChannelData[i];
-                float inR = rightChannelData[i];
-
-                // Process sample for each voice and sum outputs.
-                float outL = 0.0f;
-                float outR = 0.0f;
                 for (auto& voice : filtersLeft)
                     outL += voice.processSample(inL);
                 for (auto& voice : filtersRight)
                     outR += voice.processSample(inR);
 
-                // Average output over voices.
                 leftChannelData[i] = outL / NV;
                 rightChannelData[i] = outR / NV;
             }
@@ -286,7 +290,6 @@ namespace project {
         template <typename FrameDataType>
         void processFrame(FrameDataType& data) {}
 
-        // Parameter handling.
         template <int P>
         void setParameter(double v) {
             if (P == 0) {
@@ -311,7 +314,7 @@ namespace project {
                 data.add(std::move(p));
             }
             {
-                parameter::data p("Resonance", { 0.1, 10.0, 0.01 });
+                parameter::data p("Resonance", { 0.1, 5.0, 0.01 });
                 registerCallback<1>(p);
                 p.setDefaultValue(1.0);
                 data.add(std::move(p));
@@ -324,8 +327,7 @@ namespace project {
             }
         }
 
-        void setExternalData(const ExternalData& ed, int index) {
-        }
+        void setExternalData(const ExternalData& ed, int index) {}
 
         void handleHiseEvent(HiseEvent& e) {
             if (e.isNoteOn()) {

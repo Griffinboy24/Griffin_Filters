@@ -12,10 +12,14 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-// Compile-time tolerance multiplier: set to 1.0f for the original 3% variation,
-// or to a higher value (e.g. 1.5f) to intensify the differences.
 #ifndef TOLERANCE_MULTIPLIER
 #define TOLERANCE_MULTIPLIER 1.0f
+#endif
+
+// Noise feedback volume macro: set to 0.0f for no noise,
+// or a higher value to increase the noise injection for self-oscillation.
+#ifndef NOISE_FEEDBACK_VOLUME
+#define NOISE_FEEDBACK_VOLUME 0.0005f
 #endif
 
 namespace project {
@@ -26,13 +30,6 @@ namespace project {
 
     // Assume FunctionsClasses::TanhHelper is defined elsewhere.
 
-    //---------------------------------------------------------------------
-    // Dual-channel Juno filter voice class with fixed per-stage tolerance.
-    // Each voice deterministically selects a candidate configuration (from fixed tables)
-    // for its left and right channels so that each voice always has a unique, consistent
-    // variation. The candidate values here vary between 1.00 and 1.03 (3% variation).
-    // The per-stage tolerances are scaled at compile time using TOLERANCE_MULTIPLIER.
-    //---------------------------------------------------------------------
     template <bool UseApproxTanh = USE_APPROX_TANH>
     class JunoFilterStereoDual {
     public:
@@ -40,8 +37,6 @@ namespace project {
             : cutoff(1000.f), resonance(1.f), sr(44100.0),
             errorThresh(0.000001f)
         {
-            // Define candidate tables for the left and right channel multipliers.
-            // These values are fixed and chosen to give about 3% variation.
             static const std::array<std::array<float, 4>, 4> candidateLeft{ {
                 {1.00f, 1.015f, 1.03f, 1.015f},
                 {1.015f, 1.03f, 1.00f, 1.015f},
@@ -55,19 +50,16 @@ namespace project {
                 {1.015f, 1.03f, 1.00f, 1.015f}
             } };
 
-            // Use a static counter so that each new voice gets a different configuration.
             static int voiceCounter = 0;
             int myIndex = voiceCounter++;
             int leftConfig = myIndex % candidateLeft.size();
             int rightConfig = (myIndex + 1) % candidateRight.size();
 
-            // Apply the compile-time multiplier to the candidate values.
             for (int i = 0; i < 4; ++i) {
                 stageToleranceLeft[i] = 1.f + (candidateLeft[leftConfig][i] - 1.f) * TOLERANCE_MULTIPLIER;
                 stageToleranceRight[i] = 1.f + (candidateRight[rightConfig][i] - 1.f) * TOLERANCE_MULTIPLIER;
             }
 
-            // Initialize state arrays.
             for (int i = 0; i < 4; ++i) {
                 yL[i] = yL_est[i] = FL[i] = 0.f;
                 yR[i] = yR_est[i] = FR[i] = 0.f;
@@ -87,27 +79,26 @@ namespace project {
             sR1 = sR2 = sR3 = sR4 = 0.f;
         }
 
-        // Process a stereo sample.
-        // inL and inR are the left/right inputs.
-        // Returns a pair {left output, right output}.
         std::pair<float, float> processSample(float inL, float inR) {
             float baseG = std::tan(cutoff * M_PI / sr);
-            // Compute per-stage g factors using the fixed tolerances.
             float gL[4], gR[4];
             for (int i = 0; i < 4; ++i) {
                 gL[i] = baseG * stageToleranceLeft[i];
                 gR[i] = baseG * stageToleranceRight[i];
             }
 
-            //--- Process left channel ---
+            // Compile-time conditional noise injection for left channel
+            float noiseL = 0.f;
+            if constexpr (NOISE_FEEDBACK_VOLUME > 0.0f)
+                noiseL = NOISE_FEEDBACK_VOLUME * (randGen.nextFloat() * 2.f - 1.f);
+
             int iter = 0;
             float residueL = 1e6f;
             while (std::abs(residueL) > errorThresh && iter < 50) {
                 for (int i = 0; i < 4; ++i)
                     yL_est[i] = yL[i];
 
-                // Multiply the tanh argument by the stage tolerance.
-                float tanh_y1 = FunctionsClasses::TanhHelper<UseApproxTanh>::tanh((inL - yL[0] - resonance * yL[3]) * stageToleranceLeft[0]);
+                float tanh_y1 = FunctionsClasses::TanhHelper<UseApproxTanh>::tanh((inL - yL[0] - resonance * yL[3] + noiseL) * stageToleranceLeft[0]);
                 float tanh_y2 = FunctionsClasses::TanhHelper<UseApproxTanh>::tanh((yL[0] - yL[1]) * stageToleranceLeft[1]);
                 float tanh_y3 = FunctionsClasses::TanhHelper<UseApproxTanh>::tanh((yL[1] - yL[2]) * stageToleranceLeft[2]);
                 float tanh_y4 = FunctionsClasses::TanhHelper<UseApproxTanh>::tanh((yL[2] - yL[3]) * stageToleranceLeft[3]);
@@ -152,14 +143,18 @@ namespace project {
             sL4 = 2.f * yL[3] - sL4;
             float outL = yL[3];
 
-            //--- Process right channel ---
+            // Compile-time conditional noise injection for right channel
+            float noiseR = 0.f;
+            if constexpr (NOISE_FEEDBACK_VOLUME > 0.0f)
+                noiseR = NOISE_FEEDBACK_VOLUME * (randGen.nextFloat() * 2.f - 1.f);
+
             int iterR = 0;
             float residueR = 1e6f;
             while (std::abs(residueR) > errorThresh && iterR < 50) {
                 for (int i = 0; i < 4; ++i)
                     yR_est[i] = yR[i];
 
-                float tanh_y1 = FunctionsClasses::TanhHelper<UseApproxTanh>::tanh((inR - yR[0] - resonance * yR[3]) * stageToleranceRight[0]);
+                float tanh_y1 = FunctionsClasses::TanhHelper<UseApproxTanh>::tanh((inR - yR[0] - resonance * yR[3] + noiseR) * stageToleranceRight[0]);
                 float tanh_y2 = FunctionsClasses::TanhHelper<UseApproxTanh>::tanh((yR[0] - yR[1]) * stageToleranceRight[1]);
                 float tanh_y3 = FunctionsClasses::TanhHelper<UseApproxTanh>::tanh((yR[1] - yR[2]) * stageToleranceRight[2]);
                 float tanh_y4 = FunctionsClasses::TanhHelper<UseApproxTanh>::tanh((yR[2] - yR[3]) * stageToleranceRight[3]);
@@ -216,12 +211,10 @@ namespace project {
         float resonance;
         float errorThresh;
 
-        // Left channel state.
         float yL[4], yL_est[4], FL[4];
         float sL1, sL2, sL3, sL4;
         float stageToleranceLeft[4];
 
-        // Right channel state.
         float yR[4], yR_est[4], FR[4];
         float sR1, sR2, sR3, sR4;
         float stageToleranceRight[4];
@@ -229,11 +222,6 @@ namespace project {
         juce::Random randGen;
     };
 
-    //---------------------------------------------------------------------
-    // Polyphonic node for the stereo Juno filter.
-    // This node instantiates voices of JunoFilterStereoDual and processes stereo input.
-    // It also implements a drive knob that multiplies the input gain so that drive = 1.0 doubles the input.
-    //---------------------------------------------------------------------
     template <int NV>
     struct Griffin_Juno242 : public data::base {
         SNEX_NODE(Griffin_Juno242);
@@ -246,7 +234,7 @@ namespace project {
         static constexpr bool isPolyphonic() { return NV > 1; }
         static constexpr bool hasTail() { return false; }
         static constexpr bool isSuspendedOnSilence() { return false; }
-        static constexpr int getFixChannelAmount() { return 2; } // Stereo output.
+        static constexpr int getFixChannelAmount() { return 2; }
 
         static constexpr int NumTables = 0;
         static constexpr int NumSliderPacks = 0;
@@ -256,7 +244,7 @@ namespace project {
 
         float cutoffFrequency = 1000.f;
         float resonance = 1.f;
-        float drive = 0.f; // Range: 0.0 (no drive) to 1.0 (drive doubles the input)
+        float drive = 0.f;
 
         SmoothedValue<float> cutoffSmooth;
         SmoothedValue<float> resonanceSmooth;
@@ -295,7 +283,6 @@ namespace project {
                 float cVal = cutoffSmooth.getNextValue();
                 float rVal = resonanceSmooth.getNextValue();
                 float driveVal = driveSmooth.getNextValue();
-                // Multiply input gain by (1 + driveVal), so drive = 1.0 doubles the input.
                 float inputGain = 1.f + driveVal;
 
                 float inL = leftChannel[i] * inputGain;
@@ -358,7 +345,6 @@ namespace project {
         void setExternalData(const ExternalData& ed, int index) {}
 
         void handleHiseEvent(HiseEvent& e) {
-            // Handle note events if needed.
         }
     };
 

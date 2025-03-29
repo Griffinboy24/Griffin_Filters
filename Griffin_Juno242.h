@@ -5,7 +5,7 @@
 #include <algorithm>
 
 #ifndef USE_APPROX_TANH
-#define USE_APPROX_TANH true
+#define USE_APPROX_TANH false
 #endif
 
 #ifndef M_PI
@@ -13,13 +13,13 @@
 #endif
 
 #ifndef TOLERANCE_MULTIPLIER
-#define TOLERANCE_MULTIPLIER 1.0f
+#define TOLERANCE_MULTIPLIER 0.5f
 #endif
 
 // Noise feedback volume macro: set to 0.0f for no noise,
 // or a higher value to increase the noise injection for self-oscillation.
 #ifndef NOISE_FEEDBACK_VOLUME
-#define NOISE_FEEDBACK_VOLUME 0.0005f
+#define NOISE_FEEDBACK_VOLUME 0.008f
 #endif
 
 namespace project {
@@ -245,10 +245,14 @@ namespace project {
         float cutoffFrequency = 1000.f;
         float resonance = 1.f;
         float drive = 0.f;
+        float inputDrive = 0.f;    // New input distortion drive
+        float outputDrive = 0.f;   // New output distortion drive
 
         SmoothedValue<float> cutoffSmooth;
         SmoothedValue<float> resonanceSmooth;
         SmoothedValue<float> driveSmooth;
+        SmoothedValue<float> inputDriveSmooth;
+        SmoothedValue<float> outputDriveSmooth;
 
         PolyData<JunoFilterStereoDual<USE_APPROX_TANH>, NV> filters;
 
@@ -257,9 +261,13 @@ namespace project {
             cutoffSmooth.reset(sampleRate, 0.01);
             resonanceSmooth.reset(sampleRate, 0.01);
             driveSmooth.reset(sampleRate, 0.01);
+            inputDriveSmooth.reset(sampleRate, 0.01);
+            outputDriveSmooth.reset(sampleRate, 0.01);
             cutoffSmooth.setCurrentAndTargetValue(cutoffFrequency);
             resonanceSmooth.setCurrentAndTargetValue(resonance);
             driveSmooth.setCurrentAndTargetValue(drive);
+            inputDriveSmooth.setCurrentAndTargetValue(inputDrive);
+            outputDriveSmooth.setCurrentAndTargetValue(outputDrive);
 
             filters.prepare(specs);
             for (auto& voice : filters)
@@ -280,25 +288,43 @@ namespace project {
             int numSamples = static_cast<int>(data.getNumSamples());
 
             for (int i = 0; i < numSamples; ++i) {
+                // Input distortion stage
+                float inL_orig = leftChannel[i];
+                float inR_orig = rightChannel[i];
+                float inputDriveVal = inputDriveSmooth.getNextValue();
+                float inL = (std::abs(inputDriveVal) < 1e-6f) ? inL_orig :
+                    std::tanh(inputDriveVal * inL_orig) / std::tanh(inputDriveVal);
+                float inR = (std::abs(inputDriveVal) < 1e-6f) ? inR_orig :
+                    std::tanh(inputDriveVal * inR_orig) / std::tanh(inputDriveVal);
+
                 float cVal = cutoffSmooth.getNextValue();
                 float rVal = resonanceSmooth.getNextValue();
-                float driveVal = driveSmooth.getNextValue();
-                float inputGain = 1.f + driveVal;
-
-                float inL = leftChannel[i] * inputGain;
-                float inR = rightChannel[i] * inputGain;
-                float outL = 0.f;
-                float outR = 0.f;
-
+                // The existing 'drive' parameter is still available if needed in future.
                 for (auto& voice : filters) {
                     voice.setCutoff(cVal);
                     voice.setResonance(rVal);
+                }
+
+                float outL = 0.f;
+                float outR = 0.f;
+                for (auto& voice : filters) {
                     auto outs = voice.processSample(inL, inR);
                     outL += outs.first;
                     outR += outs.second;
                 }
-                leftChannel[i] = outL / NV;
-                rightChannel[i] = outR / NV;
+                // Average filter output
+                outL /= NV;
+                outR /= NV;
+
+                // Output distortion stage
+                float outputDriveVal = outputDriveSmooth.getNextValue();
+                outL = (std::abs(outputDriveVal) < 1e-6f) ? outL :
+                    std::tanh(outputDriveVal * outL) / std::tanh(outputDriveVal);
+                outR = (std::abs(outputDriveVal) < 1e-6f) ? outR :
+                    std::tanh(outputDriveVal * outR) / std::tanh(outputDriveVal);
+
+                leftChannel[i] = outL;
+                rightChannel[i] = outR;
             }
         }
 
@@ -319,6 +345,14 @@ namespace project {
                 drive = static_cast<float>(v);
                 driveSmooth.setTargetValue(drive);
             }
+            else if (P == 3) {
+                inputDrive = static_cast<float>(v);
+                inputDriveSmooth.setTargetValue(inputDrive);
+            }
+            else if (P == 4) {
+                outputDrive = static_cast<float>(v);
+                outputDriveSmooth.setTargetValue(outputDrive);
+            }
         }
 
         void createParameters(ParameterDataList& data) {
@@ -337,6 +371,18 @@ namespace project {
             {
                 parameter::data p("Drive", { 0.0, 1.0, 0.01 });
                 registerCallback<2>(p);
+                p.setDefaultValue(0.0);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Input Drive", { 0.0, 5.0, 0.01 });
+                registerCallback<3>(p);
+                p.setDefaultValue(0.0);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Output Drive", { 0.0, 5.0, 0.01 });
+                registerCallback<4>(p);
                 p.setDefaultValue(0.0);
                 data.add(std::move(p));
             }

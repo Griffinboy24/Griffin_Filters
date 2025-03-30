@@ -212,7 +212,7 @@ namespace project {
             registerCallback<0>(p1);
             p1.setDefaultValue(1000.0);
             data.add(std::move(p1));
-            parameter::data p2("Resonance", { 0.1, 4.0, 0.00001 });
+            parameter::data p2("Resonance", { 0.1, 4.3, 0.00001 });
             registerCallback<1>(p2);
             p2.setDefaultValue(0.8);
             data.add(std::move(p2));

@@ -4,10 +4,6 @@
 #include <array>
 #include <algorithm>
 
-#ifndef USE_APPROX_TANH
-#define USE_APPROX_TANH false
-#endif
-
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -20,35 +16,9 @@
 #define NOISE_FEEDBACK_VOLUME 0.008f
 #endif
 
-// New transistor nonlinearity functions to yield more realistic distortion.
-namespace transistorHelpers {
-
-    // Realistic transistor nonlinearity with asymmetry.
-    inline float transistorNonlinearity(float x)
-    {
-        const float posGain = 1.0f;    // Gain for positive half-cycle.
-        const float negGain = 0.85f;   // Gain for negative half-cycle.
-        if (x >= 0.0f)
-            return std::tanh(posGain * x);
-        else
-            return std::tanh(negGain * x);
-    }
-
-    // Derivative of the transistor nonlinearity function.
-    inline float transistorNonlinearityDerivative(float x)
-    {
-        const float posGain = 1.0f;
-        const float negGain = 0.85f;
-        if (x >= 0.0f) {
-            float t = std::tanh(posGain * x);
-            return posGain * (1.0f - t * t);
-        }
-        else {
-            float t = std::tanh(negGain * x);
-            return negGain * (1.0f - t * t);
-        }
-    }
-}
+#ifndef MAX_NEWTON_ITERATIONS
+#define MAX_NEWTON_ITERATIONS 15
+#endif
 
 namespace project {
 
@@ -56,37 +26,50 @@ namespace project {
     using namespace hise;
     using namespace scriptnode;
 
-    template <bool UseApproxTanh = USE_APPROX_TANH>
+    // Fast tanh approximation
+    struct TanhHelper2 {
+        static inline float tanh(float x) {
+            float x2 = x * x;
+            float sh = x * (1.f + x2 * (1.f / 6.f + x2 * (1.f / 120.f)));
+            return sh / std::sqrt(1.f + sh * sh);
+        }
+    };
+
+    // Transistor nonlinearity functions using TanhHelper.
+    inline float transistorNonlinearity(float x)
+    {
+        constexpr float posGain = 1.0f;
+        constexpr float negGain = 0.85f;
+        if (x >= 0.f)
+            return TanhHelper2::tanh(posGain * x);
+        else
+            return TanhHelper2::tanh(negGain * x);
+    }
+
+    inline float transistorNonlinearityDerivative(float x)
+    {
+        constexpr float posGain = 1.0f;
+        constexpr float negGain = 0.85f;
+        float t;
+        if (x >= 0.f) {
+            t = TanhHelper2::tanh(posGain * x);
+            return posGain * (1.f - t * t);
+        }
+        else {
+            t = TanhHelper2::tanh(negGain * x);
+            return negGain * (1.f - t * t);
+        }
+    }
+
     class JunoFilterStereoDual {
     public:
         JunoFilterStereoDual()
-            : cutoff(1000.f), resonance(1.f), sr(44100.0),
-            errorThresh(0.000001f)
+            : cutoff(1000.f), resonance(1.f), sr(44100.0), errorThresh(0.0000015f)
         {
-            static const std::array<std::array<float, 4>, 4> candidateLeft{ {
-                {1.00f, 1.015f, 1.03f, 1.015f},
-                {1.015f, 1.03f, 1.00f, 1.015f},
-                {1.03f, 1.00f, 1.015f, 1.03f},
-                {1.015f, 1.03f, 1.015f, 1.00f}
-            } };
-            static const std::array<std::array<float, 4>, 4> candidateRight{ {
-                {1.03f, 1.015f, 1.00f, 1.015f},
-                {1.015f, 1.00f, 1.03f, 1.015f},
-                {1.00f, 1.015f, 1.03f, 1.00f},
-                {1.015f, 1.03f, 1.00f, 1.015f}
-            } };
-
-            static int voiceCounter = 0;
-            int myIndex = voiceCounter++;
-            int leftConfig = myIndex % candidateLeft.size();
-            int rightConfig = (myIndex + 1) % candidateRight.size();
-
+            // Use unity tolerances.
             for (int i = 0; i < 4; ++i) {
-                stageToleranceLeft[i] = 1.f + (candidateLeft[leftConfig][i] - 1.f) * TOLERANCE_MULTIPLIER;
-                stageToleranceRight[i] = 1.f + (candidateRight[rightConfig][i] - 1.f) * TOLERANCE_MULTIPLIER;
-            }
-
-            for (int i = 0; i < 4; ++i) {
+                stageToleranceLeft[i] = 1.f;
+                stageToleranceRight[i] = 1.f;
                 yL[i] = yL_est[i] = FL[i] = 0.f;
                 yR[i] = yR_est[i] = FR[i] = 0.f;
             }
@@ -113,35 +96,35 @@ namespace project {
                 gR[i] = baseG * stageToleranceRight[i];
             }
 
-            // Noise injection for left channel.
+            // Left channel noise injection.
             float noiseL = 0.f;
-            if constexpr (NOISE_FEEDBACK_VOLUME > 0.0f)
+            if constexpr (NOISE_FEEDBACK_VOLUME > 0.f)
                 noiseL = NOISE_FEEDBACK_VOLUME * (randGen.nextFloat() * 2.f - 1.f);
 
             int iter = 0;
             float residueL = 1e6f;
-            while (std::abs(residueL) > errorThresh && iter < 50) {
+            while (std::abs(residueL) > errorThresh && iter < MAX_NEWTON_ITERATIONS) {
                 for (int i = 0; i < 4; ++i)
                     yL_est[i] = yL[i];
 
-                float x1 = (inL - yL[0] - resonance * yL[3] + noiseL) * stageToleranceLeft[0];
-                float tanh_y1 = transistorHelpers::transistorNonlinearity(x1);
-                float x2 = (yL[0] - yL[1]) * stageToleranceLeft[1];
-                float tanh_y2 = transistorHelpers::transistorNonlinearity(x2);
-                float x3 = (yL[1] - yL[2]) * stageToleranceLeft[2];
-                float tanh_y3 = transistorHelpers::transistorNonlinearity(x3);
-                float x4 = (yL[2] - yL[3]) * stageToleranceLeft[3];
-                float tanh_y4 = transistorHelpers::transistorNonlinearity(x4);
+                float x1 = inL - yL[0] - resonance * yL[3] + noiseL;
+                float tanh_y1 = transistorNonlinearity(x1);
+                float x2 = yL[0] - yL[1];
+                float tanh_y2 = transistorNonlinearity(x2);
+                float x3 = yL[1] - yL[2];
+                float tanh_y3 = transistorNonlinearity(x3);
+                float x4 = yL[2] - yL[3];
+                float tanh_y4 = transistorNonlinearity(x4);
 
                 FL[0] = gL[0] * tanh_y1 + sL1 - yL[0];
                 FL[1] = gL[1] * tanh_y2 + sL2 - yL[1];
                 FL[2] = gL[2] * tanh_y3 + sL3 - yL[2];
                 FL[3] = gL[3] * tanh_y4 + sL4 - yL[3];
 
-                float help_y1 = transistorHelpers::transistorNonlinearityDerivative(x1);
-                float help_y2 = transistorHelpers::transistorNonlinearityDerivative(x2);
-                float help_y3 = transistorHelpers::transistorNonlinearityDerivative(x3);
-                float help_y4 = transistorHelpers::transistorNonlinearityDerivative(x4);
+                float help_y1 = transistorNonlinearityDerivative(x1);
+                float help_y2 = transistorNonlinearityDerivative(x2);
+                float help_y3 = transistorNonlinearityDerivative(x3);
+                float help_y4 = transistorNonlinearityDerivative(x4);
 
                 float jL00 = -gL[0] * help_y1 - 1.f;
                 float jL03 = -gL[0] * resonance * help_y1;
@@ -177,35 +160,35 @@ namespace project {
             sL4 = 2.f * yL[3] - sL4;
             float outL = yL[3];
 
-            // Noise injection for right channel.
+            // Right channel noise injection.
             float noiseR = 0.f;
-            if constexpr (NOISE_FEEDBACK_VOLUME > 0.0f)
+            if constexpr (NOISE_FEEDBACK_VOLUME > 0.f)
                 noiseR = NOISE_FEEDBACK_VOLUME * (randGen.nextFloat() * 2.f - 1.f);
 
             int iterR = 0;
             float residueR = 1e6f;
-            while (std::abs(residueR) > errorThresh && iterR < 50) {
+            while (std::abs(residueR) > errorThresh && iterR < MAX_NEWTON_ITERATIONS) {
                 for (int i = 0; i < 4; ++i)
                     yR_est[i] = yR[i];
 
-                float rx1 = (inR - yR[0] - resonance * yR[3] + noiseR) * stageToleranceRight[0];
-                float tanh_y1_r = transistorHelpers::transistorNonlinearity(rx1);
-                float rx2 = (yR[0] - yR[1]) * stageToleranceRight[1];
-                float tanh_y2_r = transistorHelpers::transistorNonlinearity(rx2);
-                float rx3 = (yR[1] - yR[2]) * stageToleranceRight[2];
-                float tanh_y3_r = transistorHelpers::transistorNonlinearity(rx3);
-                float rx4 = (yR[2] - yR[3]) * stageToleranceRight[3];
-                float tanh_y4_r = transistorHelpers::transistorNonlinearity(rx4);
+                float rx1 = inR - yR[0] - resonance * yR[3] + noiseR;
+                float tanh_y1_r = transistorNonlinearity(rx1);
+                float rx2 = yR[0] - yR[1];
+                float tanh_y2_r = transistorNonlinearity(rx2);
+                float rx3 = yR[1] - yR[2];
+                float tanh_y3_r = transistorNonlinearity(rx3);
+                float rx4 = yR[2] - yR[3];
+                float tanh_y4_r = transistorNonlinearity(rx4);
 
                 FR[0] = gR[0] * tanh_y1_r + sR1 - yR[0];
                 FR[1] = gR[1] * tanh_y2_r + sR2 - yR[1];
                 FR[2] = gR[2] * tanh_y3_r + sR3 - yR[2];
                 FR[3] = gR[3] * tanh_y4_r + sR4 - yR[3];
 
-                float help_y1_r = transistorHelpers::transistorNonlinearityDerivative(rx1);
-                float help_y2_r = transistorHelpers::transistorNonlinearityDerivative(rx2);
-                float help_y3_r = transistorHelpers::transistorNonlinearityDerivative(rx3);
-                float help_y4_r = transistorHelpers::transistorNonlinearityDerivative(rx4);
+                float help_y1_r = transistorNonlinearityDerivative(rx1);
+                float help_y2_r = transistorNonlinearityDerivative(rx2);
+                float help_y3_r = transistorNonlinearityDerivative(rx3);
+                float help_y4_r = transistorNonlinearityDerivative(rx4);
 
                 float jR00 = -gR[0] * help_y1_r - 1.f;
                 float jR03 = -gR[0] * resonance * help_y1_r;
@@ -278,39 +261,23 @@ namespace project {
         static constexpr bool isSuspendedOnSilence() { return false; }
         static constexpr int getFixChannelAmount() { return 2; }
 
+        // Required static members.
         static constexpr int NumTables = 0;
         static constexpr int NumSliderPacks = 0;
         static constexpr int NumAudioFiles = 0;
         static constexpr int NumFilters = 0;
         static constexpr int NumDisplayBuffers = 0;
 
+        // Parameters (update immediately on callback)
         float cutoffFrequency = 1000.f;
         float resonance = 1.f;
-        float drive = 0.f;
-        float inputDrive = 0.f;
-        float outputDrive = 0.f;
+        // Input drive is now a compile-time constant.
+        static constexpr float inputDrive = 1.2f;
 
-        SmoothedValue<float> cutoffSmooth;
-        SmoothedValue<float> resonanceSmooth;
-        SmoothedValue<float> driveSmooth;
-        SmoothedValue<float> inputDriveSmooth;
-        SmoothedValue<float> outputDriveSmooth;
-
-        PolyData<JunoFilterStereoDual<USE_APPROX_TANH>, NV> filters;
+        PolyData<JunoFilterStereoDual, NV> filters;
 
         void prepare(PrepareSpecs specs) {
             double sampleRate = specs.sampleRate;
-            cutoffSmooth.reset(sampleRate, 0.01);
-            resonanceSmooth.reset(sampleRate, 0.01);
-            driveSmooth.reset(sampleRate, 0.01);
-            inputDriveSmooth.reset(sampleRate, 0.01);
-            outputDriveSmooth.reset(sampleRate, 0.01);
-            cutoffSmooth.setCurrentAndTargetValue(cutoffFrequency);
-            resonanceSmooth.setCurrentAndTargetValue(resonance);
-            driveSmooth.setCurrentAndTargetValue(drive);
-            inputDriveSmooth.setCurrentAndTargetValue(inputDrive);
-            outputDriveSmooth.setCurrentAndTargetValue(outputDrive);
-
             filters.prepare(specs);
             for (auto& voice : filters)
                 voice.prepare(sampleRate);
@@ -329,22 +296,22 @@ namespace project {
             float* rightChannel = audioBlock.getChannelPointer(1);
             int numSamples = static_cast<int>(data.getNumSamples());
 
+            // Hoist parameter values.
+            float cVal = cutoffFrequency;
+            float rVal = resonance;
+
+            for (auto& voice : filters) {
+                voice.setCutoff(cVal);
+                voice.setResonance(rVal);
+            }
+
             for (int i = 0; i < numSamples; ++i) {
-                // Input distortion stage.
                 float inL_orig = leftChannel[i];
                 float inR_orig = rightChannel[i];
-                float inputDriveVal = inputDriveSmooth.getNextValue();
-                float inL = (std::abs(inputDriveVal) < 1e-6f) ? inL_orig :
-                    std::tanh(inputDriveVal * inL_orig) / std::tanh(inputDriveVal);
-                float inR = (std::abs(inputDriveVal) < 1e-6f) ? inR_orig :
-                    std::tanh(inputDriveVal * inR_orig) / std::tanh(inputDriveVal);
-
-                float cVal = cutoffSmooth.getNextValue();
-                float rVal = resonanceSmooth.getNextValue();
-                for (auto& voice : filters) {
-                    voice.setCutoff(cVal);
-                    voice.setResonance(rVal);
-                }
+                float inL = (std::abs(inputDrive) < 1e-6f) ? inL_orig :
+                    TanhHelper2::tanh(inputDrive * inL_orig) / TanhHelper2::tanh(inputDrive);
+                float inR = (std::abs(inputDrive) < 1e-6f) ? inR_orig :
+                    TanhHelper2::tanh(inputDrive * inR_orig) / TanhHelper2::tanh(inputDrive);
 
                 float outL = 0.f;
                 float outR = 0.f;
@@ -356,13 +323,6 @@ namespace project {
                 outL /= NV;
                 outR /= NV;
 
-                // Output distortion stage.
-                float outputDriveVal = outputDriveSmooth.getNextValue();
-                outL = (std::abs(outputDriveVal) < 1e-6f) ? outL :
-                    std::tanh(outputDriveVal * outL) / std::tanh(outputDriveVal);
-                outR = (std::abs(outputDriveVal) < 1e-6f) ? outR :
-                    std::tanh(outputDriveVal * outR) / std::tanh(outputDriveVal);
-
                 leftChannel[i] = outL;
                 rightChannel[i] = outR;
             }
@@ -371,27 +331,18 @@ namespace project {
         template <typename FrameDataType>
         void processFrame(FrameDataType& data) {}
 
+        // Immediate parameter callback updates.
         template <int P>
         void setParameter(double v) {
             if (P == 0) {
                 cutoffFrequency = static_cast<float>(v);
-                cutoffSmooth.setTargetValue(cutoffFrequency);
+                for (auto& voice : filters)
+                    voice.setCutoff(cutoffFrequency);
             }
             else if (P == 1) {
                 resonance = static_cast<float>(v);
-                resonanceSmooth.setTargetValue(resonance);
-            }
-            else if (P == 2) {
-                drive = static_cast<float>(v);
-                driveSmooth.setTargetValue(drive);
-            }
-            else if (P == 3) {
-                inputDrive = static_cast<float>(v);
-                inputDriveSmooth.setTargetValue(inputDrive);
-            }
-            else if (P == 4) {
-                outputDrive = static_cast<float>(v);
-                outputDriveSmooth.setTargetValue(outputDrive);
+                for (auto& voice : filters)
+                    voice.setResonance(resonance);
             }
         }
 
@@ -403,35 +354,16 @@ namespace project {
                 data.add(std::move(p));
             }
             {
-                parameter::data p("Resonance", { 0.1, 4.0, 0.01 });
+                parameter::data p("Resonance", { 0.1, 3.8, 0.01 });
                 registerCallback<1>(p);
                 p.setDefaultValue(1.0);
-                data.add(std::move(p));
-            }
-            {
-                parameter::data p("Drive", { 0.0, 1.0, 0.01 });
-                registerCallback<2>(p);
-                p.setDefaultValue(0.0);
-                data.add(std::move(p));
-            }
-            {
-                parameter::data p("Input Drive", { 0.0, 5.0, 0.01 });
-                registerCallback<3>(p);
-                p.setDefaultValue(0.0);
-                data.add(std::move(p));
-            }
-            {
-                parameter::data p("Output Drive", { 0.0, 5.0, 0.01 });
-                registerCallback<4>(p);
-                p.setDefaultValue(0.0);
                 data.add(std::move(p));
             }
         }
 
         void setExternalData(const ExternalData& ed, int index) {}
 
-        void handleHiseEvent(HiseEvent& e) {
-        }
+        void handleHiseEvent(HiseEvent& e) {}
     };
 
 } // namespace project
